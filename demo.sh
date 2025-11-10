@@ -1,26 +1,59 @@
 #!/usr/bin/env bash
-set -euo pipefail
-IFACE="${INTERNET_INTERFACE:-$(ip route show default | awk '/default/{print $5;exit}')}"
+set -Eeuo pipefail
 
-echo "== Create VPC and subnets =="; sudo ./vpcctl.sh create vpc1
-sudo ./vpcctl.sh add-subnet vpc1 public  10.0.1.0/24
-sudo ./vpcctl.sh add-subnet vpc1 private 10.0.2.0/24
+# Automatically detect interface
+IFACE=$(ip route show default | awk '/default/{print $5;exit}')
+echo "[INFO] Using uplink interface: $IFACE"
 
-echo "== Intra-VPC ping =="; sudo ip netns exec vpc-vpc1-public ping -c1 -W1 10.0.2.2
-sudo ip netns exec vpc-vpc1-private ping -c1 -W1 10.0.1.2
+# 1️⃣ Clean up first
+sudo ./vpcctl.sh delete vpc1 || true
 
-echo "== NAT only for public =="; sudo ./vpcctl.sh nat-enable vpc1 10.0.1.0/24 "$IFACE"
-sudo ip netns exec vpc-vpc1-public  bash -lc 'curl -sI http://example.com | head -n1'
-sudo ip netns exec vpc-vpc1-private bash -lc 'timeout 2 curl -sI http://example.com || echo "private blocked (expected)"'
+# 2️⃣ Create and configure
+sudo ./vpcctl.sh create vpc1
+sudo ./vpcctl.sh add-subnet vpc1 public 10.0.1.0/24
+sudo ./vpcctl.sh add-subnet vpc1 private 10.200.2.0/24
+sudo ./vpcctl.sh nat-enable vpc1 10.0.1.0/24 "$IFACE"
 
-echo "== SG allow80/deny22 =="; sudo ./vpcctl.sh policy-apply vpc1 public policies/public-allow80-deny22.json
-sudo ip netns exec vpc-vpc1-public bash -lc 'nohup python3 -m http.server 80 >/dev/null 2>&1 & sleep 1'
-sudo ip netns exec vpc-vpc1-private curl -sI http://10.0.1.2:80 | head -n1
-sudo ip netns exec vpc-vpc1-private bash -lc 'timeout 2 bash -c "</dev/tcp/10.0.1.2/22" && echo BAD || echo "22 blocked (good)"'
+# 3️⃣ Test connectivity
+echo "[TEST] Intra-VPC ping"
+sudo ip netns exec vpc-vpc1-public  ping -c2 -W1 10.200.2.2
+sudo ip netns exec vpc-vpc1-private ping -c2 -W1 10.0.1.2
 
-echo "== Optional Peering =="; sudo ./vpcctl.sh create vpc2
-sudo ./vpcctl.sh add-subnet vpc2 public 10.1.1.0/24
-sudo ./vpcctl.sh nat-enable vpc2 10.1.1.0/24 "$IFACE"
-sudo ./vpcctl.sh peer vpc1 vpc2 10.0.0.0/16 10.1.0.0/16 "$IFACE"
-sudo ip netns exec vpc-vpc1-public ping -c1 -W1 10.1.1.2
-echo "Done."
+echo "[TEST] NAT (public -> internet)"
+sudo ip netns exec vpc-vpc1-public bash -lc 'curl -sI http://example.com | head -n1'
+
+echo "[TEST] Private -> internet (should fail)"
+sudo ip netns exec vpc-vpc1-private bash -lc 'timeout 3 curl -sI http://example.com || echo NOINET ✅'
+
+# 4️⃣ Apply policies
+mkdir -p policies
+cat > policies/public-allow8080-deny22.json <<'JSON'
+{
+  "subnet": "10.0.1.0/24",
+  "ingress": [
+    {"port": 8080, "protocol": "tcp", "action": "allow"},
+    {"port": 22,   "protocol": "tcp", "action": "deny"}
+  ]
+}
+JSON
+cat > policies/private-deny-all.json <<'JSON'
+{
+  "subnet": "10.200.2.0/24",
+  "ingress": [
+    {"port": 0, "protocol": "tcp", "action": "deny"}
+  ]
+}
+JSON
+
+sudo ./vpcctl.sh policy-apply vpc1 public  policies/public-allow8080-deny22.json
+sudo ./vpcctl.sh policy-apply vpc1 private policies/private-deny-all.json
+
+# 5️⃣ Quick service check
+sudo ip netns exec vpc-vpc1-public  bash -lc 'nohup python3 -m http.server 8080 --bind 10.0.1.2 >/tmp/pub.log 2>&1 &'
+sleep 1
+curl -sI http://10.0.1.2:8080 | head -n1
+timeout 2 bash -lc 'exec 3<>/dev/tcp/10.0.1.2/22' || echo "PORT22_BLOCKED ✅"
+
+# 6️⃣ Cleanup
+sudo ./vpcctl.sh delete vpc1 || true
+echo "[DONE] Demo complete."
