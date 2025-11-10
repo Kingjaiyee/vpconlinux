@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ---------- utils ----------
-log(){ echo "[$(date +'%F %T')] $*"; }
+# ------------------ utils ------------------
+# Log to STDERR so stdout stays clean for parsing
+log(){ echo "[$(date +'%F %T')] $*" >&2; }
 need_root(){ [ "$EUID" -eq 0 ] || exec sudo -E bash "$0" "$@"; }
 need_root "$@"
 
@@ -10,8 +11,10 @@ exists_ns(){ ip netns list | awk '{print $1}' | grep -qx "$1"; }
 gw_from_cidr(){ awk -F'[./]' '{printf "%s.%s.%s.1\n",$1,$2,$3}' <<<"$1"; }   # assumes /24
 net_from_cidr(){ cut -d/ -f1 <<<"$1"; }
 mask_from_cidr(){ cut -d/ -f2 <<<"$1"; }
+short_tag(){  echo "$1" | tr -cd 'a-zA-Z0-9' | cut -c1-6; }   # <=6 chars
+hash_octet(){ printf "%s" "$1" | cksum | awk '{print 100+($1%150)}'; } # 100..249
 
-# ---------- primitives ----------
+# ---------------- primitives ----------------
 create_bridge() {
   local ns="$1" br="$2"
   if ! exists_ns "$ns"; then
@@ -44,35 +47,35 @@ create_subnet_ns() {
   ip -n "$ns" link set lo up
 }
 
-# FIXED: create when either end is missing, delete orphans, always enslave to bridge
+# Create (or repair) a veth pair between a subnet ns and the router ns,
+# then attach the router side to the bridge. Uses short names (<=15 chars).
 create_veth_to_bridge(){
   # host_ns vethA  router_ns vethB  bridge_if
   local host_ns="$1" vA="$2" rns="$3" vB="$4" br="$5"
 
-  # (Re)create pair if either end is missing
   if ! ( ip -n "$host_ns" link show "$vA" &>/dev/null && ip -n "$rns" link show "$vB" &>/dev/null ); then
-    # Clean up possible half-created ends to avoid "File exists"
     ip -n "$host_ns" link show "$vA" &>/dev/null && ip -n "$host_ns" link del "$vA" || true
     ip -n "$rns"     link show "$vB" &>/dev/null && ip -n "$rns"     link del "$vB" || true
+    ip link show "$vA" &>/dev/null && ip link del "$vA" || true
+    ip link show "$vB" &>/dev/null && ip link del "$vB" || true
 
-    log "Create veth $host_ns:$vA <-> $rns:$vB"
-    ip link add "$vA" netns "$host_ns" type veth peer name "$vB" netns "$rns"
+    log "Create veth (root): $vA <-> $vB ; move into $host_ns and $rns"
+    ip link add name "$vA" type veth peer name "$vB"
+    ip link set "$vA" netns "$host_ns"
+    ip link set "$vB" netns "$rns"
   else
     log "Veth $host_ns:$vA <-> $rns:$vB exists"
   fi
 
-  # Ensure both ends are up
   ip -n "$host_ns" link set "$vA" up
   ip -n "$rns"     link set "$vB" up
 
-  # Ensure router end is attached to bridge
   ip -n "$rns" link set "$vB" master "$br" 2>/dev/null || {
     log "Attach $rns:$vB to bridge $br"
     ip -n "$rns" link set "$vB" master "$br"
   }
 }
 
-# Safer: only add IP if not present; always ensure default route
 assign_ips_and_routes(){
   # ns veth ip_cidr gw
   local ns="$1" veth="$2" ipcidr="$3" gw="$4"
@@ -90,10 +93,11 @@ connect_bridges(){
 
   if ! ( ip -n "$ns1" link show "$p1" &>/dev/null && ip -n "$ns2" link show "$p2" &>/dev/null ); then
     log "Connect bridges $ns1/$br1 <-> $ns2/$br2"
-    # remove orphans if any
     ip -n "$ns1" link show "$p1" &>/dev/null && ip -n "$ns1" link del "$p1" || true
     ip -n "$ns2" link show "$p2" &>/dev/null && ip -n "$ns2" link del "$p2" || true
-    ip link add "$p1" netns "$ns1" type veth peer name "$p2" netns "$ns2"
+    ip link add "$p1" type veth peer name "$p2"
+    ip link set "$p1" netns "$ns1"
+    ip link set "$p2" netns "$ns2"
   else
     log "Bridge interconnect exists"
   fi
@@ -104,7 +108,44 @@ connect_bridges(){
   ip -n "$ns2" link set "$p2" master "$br2"
 }
 
-# ---------- orchestration ----------
+# Create (or ensure) host uplink for a VPC router ns:
+# host if: u<vpctag>h   router if: u<vpctag>r   /30: 169.254.<X>.1/30 <-> .2/30
+ensure_host_uplink(){
+  local vpc="$1"
+  local rns="vpc-${vpc}-rt"
+  local vtag; vtag="$(short_tag "$vpc")"
+  local hi="u${vtag}h"  # host iface
+  local ri="u${vtag}r"  # router iface
+  local X; X="$(hash_octet "$vpc")"
+  local HIP="169.254.${X}.1/30"
+  local RIP="169.254.${X}.2/30"
+  local HGW="169.254.${X}.1"
+
+  if ! ( ip link show "$hi" &>/dev/null || ip -n "$rns" link show "$ri" &>/dev/null ); then
+    log "Create VPC uplink (root): $hi <-> $ri ; move router end to $rns"
+    ip link add name "$hi" type veth peer name "$ri"
+    ip link set "$ri" netns "$rns"
+  fi
+
+  ip addr show "$hi" 2>/dev/null | grep -q " $HIP" || ip addr add "$HIP" dev "$hi" || true
+  ip link set "$hi" up
+
+  ip -n "$rns" addr show "$ri" 2>/dev/null | grep -q " ${RIP}" || ip -n "$rns" addr add "$RIP" dev "$ri" || true
+  ip -n "$rns" link set "$ri" up
+
+  ip -n "$rns" route replace default via "$HGW" dev "$ri"
+
+  # Make sure these do not speak on stdout:
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  iptables -C FORWARD -j ACCEPT >/dev/null 2>&1 || iptables -I FORWARD -j ACCEPT >/dev/null 2>&1
+  sysctl -w "net.ipv4.conf.${hi}.rp_filter=0" >/dev/null || true
+
+  # Print ONLY one clean line that nat-enable can safely parse:
+  # Format: UPLINK <host_if> <router_ip> <host_ip>
+  echo "UPLINK ${hi} ${RIP%/30} ${HIP%/30}"
+}
+
+# ---------------- orchestration --------------
 vpc_create(){
   local vpc="$1"
   [ -n "${vpc:-}" ] || { echo "Usage: $0 create <VPC>"; exit 1; }
@@ -128,10 +169,11 @@ vpc_add_subnet(){
   create_bridge "$rns" "$br"
   create_subnet_ns "$sns"
 
-  # give bridge the gateway for this subnet if missing
   ip -n "$rns" addr show "$br" | grep -q " $gw/" || ip -n "$rns" addr add "$gw/$mask" dev "$br"
 
-  local vA="veth-${vpc}-${sname}" vB="veth-${vpc}-${sname}-br"
+  local vA="v$(short_tag "$vpc")$(short_tag "$sname")"
+  local vB="${vA}r"
+
   create_veth_to_bridge "$sns" "$vA" "$rns" "$vB" "$br"
   assign_ips_and_routes "$sns" "$vA" "${host_ip}/${mask}" "$gw"
 
@@ -142,12 +184,33 @@ vpc_enable_nat(){
   # nat-enable <VPC> <PUBLIC_CIDR> <HOST_IFACE>
   local vpc="$1" cidr="$2" iface="$3"
   [ -n "$vpc" ] && [ -n "$cidr" ] && [ -n "$iface" ] || { echo "Usage: $0 nat-enable <VPC> <CIDR> <IFACE>"; exit 1; }
+
+  # Capture only the UPLINK line, ignore any noisy stdout
+  local upline
+  upline="$(ensure_host_uplink "$vpc" | awk '/^UPLINK /{print; exit}')"
+  if [ -z "${upline:-}" ]; then
+    log "FATAL: could not obtain UPLINK triplet from ensure_host_uplink"
+    exit 1
+  fi
+
+  local marker hi RIP HIP
+  read -r marker hi RIP HIP <<<"$upline"
+  if [ "$marker" != "UPLINK" ] || [ -z "${hi:-}" ] || [ -z "${RIP:-}" ] || [ -z "${HIP:-}" ]; then
+    log "FATAL: malformed uplink line: '$upline'"
+    exit 1
+  fi
+
+  # Host NAT (quiet)
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  iptables -t nat -C POSTROUTING -s "$cidr" -o "$iface" -j MASQUERADE 2>/dev/null || {
+  iptables -t nat -C POSTROUTING -s "$cidr" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || {
     log "Add MASQUERADE for $cidr -> $iface"
-    iptables -t nat -A POSTROUTING -s "$cidr" -o "$iface" -j MASQUERADE
+    iptables -t nat -A POSTROUTING -s "$cidr" -o "$iface" -j MASQUERADE >/dev/null 2>&1
   }
-  log "NAT enabled for $vpc ($cidr via $iface)"
+
+  # Ensure host can route replies back into the VPC via router-uplink IP
+  ip route replace "$cidr" via "$RIP" dev "$hi"
+
+  log "NAT enabled for $vpc ($cidr via $iface, uplink=$hi; host route -> $RIP)"
 }
 
 vpc_peer(){
@@ -162,14 +225,16 @@ vpc_peer(){
   create_bridge "$rB" "$brB"
   connect_bridges "$rA" "$brA" "$rB" "$brB"
 
-  # static routes at router namespaces
   ip -n "$rA" route replace "$cidrB" dev "$brA"
   ip -n "$rB" route replace "$cidrA" dev "$brB"
 
-  # NAT peering exclusions (must precede MASQUERADE)
-  iptables -t nat -C POSTROUTING -s "$cidrA" -d "$cidrB" -j RETURN 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$cidrA" -d "$cidrB" -j RETURN
-  iptables -t nat -C POSTROUTING -s "$cidrB" -d "$cidrA" -j RETURN 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s "$cidrB" -d "$cidrA" -j RETURN
-  iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE
+  ensure_host_uplink "$a" >/dev/null
+  ensure_host_uplink "$b" >/dev/null
+
+  # NAT peering exclusions
+  iptables -t nat -C POSTROUTING -s "$cidrA" -d "$cidrB" -j RETURN >/dev/null 2>&1 || iptables -t nat -I POSTROUTING 1 -s "$cidrA" -d "$cidrB" -j RETURN >/dev/null 2>&1
+  iptables -t nat -C POSTROUTING -s "$cidrB" -d "$cidrA" -j RETURN >/dev/null 2>&1 || iptables -t nat -I POSTROUTING 1 -s "$cidrB" -d "$cidrA" -j RETURN >/dev/null 2>&1
+  iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -o "$iface" -j MASQUERADE >/dev/null 2>&1
 
   log "Peered $a <$cidrA> with $b <$cidrB> (NAT exclusions set)"
 }
@@ -239,7 +304,8 @@ Usage:
   $0 list
 Notes:
   - /24 assumption for gateway calc (10.x.y.1). Extend gw_from_cidr for other masks.
-  - Run with sudo (the script will re-exec with sudo if needed).
+  - nat-enable creates/ensures a host-uplink veth (u<vpctag>h <-> u<vpctag>r),
+    sets router default route, and adds a host route back to the public CIDR.
 EOF
 }
 
