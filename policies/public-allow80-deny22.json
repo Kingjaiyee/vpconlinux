@@ -1,7 +1,7 @@
 {
-  "subnet": "10.0.1.0/24",
+  "subnet": "10.200.1.0/24",
   "ingress": [
-    { "port": 80, "protocol": "tcp", "action": "allow" },
-    { "port": 22, "protocol": "tcp", "action": "deny" }
+    {"port": 8080, "protocol": "tcp", "action": "allow"},
+    {"port": 22,   "protocol": "tcp", "action": "deny"}
   ]
 }
