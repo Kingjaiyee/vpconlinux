@@ -245,14 +245,15 @@ vpc_policy_apply(){
   [ -f "$file" ] || { echo "Policy file not found: $file"; exit 1; }
   local ns="vpc-${vpc}-${sname}"
 
-  # minimal JSON parse: {"ingress":[{"port":80,"protocol":"tcp","action":"allow"},...]}
+  # minimal JSON parse: {"ingress":[{"port":80,"protocol":"tcp","action":"allow"}, ...]}
   local rules
   rules=$(tr -d '\n\r ' < "$file" | sed 's/.*"ingress":\[\(.*\)\].*/\1/' | tr '}' '\n' | sed 's/^{//;s/,*$//')
 
-  ip -n "$ns" iptables -P INPUT DROP
-  ip -n "$ns" iptables -F INPUT
-  ip -n "$ns" iptables -A INPUT -i lo -j ACCEPT
-  ip -n "$ns" iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+  # Use ip netns exec (NOT `ip -n ...`)
+  ip netns exec "$ns" iptables -P INPUT DROP
+  ip netns exec "$ns" iptables -F INPUT
+  ip netns exec "$ns" iptables -A INPUT -i lo -j ACCEPT
+  ip netns exec "$ns" iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
   while IFS= read -r r; do
     [ -z "$r" ] && continue
@@ -260,18 +261,32 @@ vpc_policy_apply(){
     port=$(sed -n 's/.*"port":\([0-9]\+\).*/\1/p' <<<"$r")
     proto=$(sed -n 's/.*"protocol":"\([a-z]\+\)".*/\1/p' <<<"$r")
     action=$(sed -n 's/.*"action":"\([a-z]\+\)".*/\1/p' <<<"$r")
-    [ -z "$port" -o -z "$proto" -o -z "$action" ] && continue
+    [ -z "$proto" -o -z "$action" ] && continue
+
+    # Port 0 = special "all ports" (deny-all)
+    if [ "${port:-0}" -eq 0 ]; then
+      if [ "$action" = "allow" ]; then
+        ip netns exec "$ns" iptables -A INPUT -p "$proto" -j ACCEPT
+        log "Allow all $proto on $ns"
+      else
+        ip netns exec "$ns" iptables -A INPUT -p "$proto" -j DROP
+        log "Deny all $proto on $ns"
+      fi
+      continue
+    fi
+
     if [ "$action" = "allow" ]; then
-      ip -n "$ns" iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
+      ip netns exec "$ns" iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT
       log "Allow $proto/$port on $ns"
     else
-      ip -n "$ns" iptables -A INPUT -p "$proto" --dport "$port" -j DROP
+      ip netns exec "$ns" iptables -A INPUT -p "$proto" --dport "$port" -j DROP
       log "Deny  $proto/$port on $ns"
     fi
   done <<< "$rules"
 
   log "Applied SG policy to $ns"
 }
+
 
 vpc_delete(){
   local vpc="$1"; [ -n "$vpc" ] || { echo "Usage: $0 delete <VPC>"; exit 1; }
